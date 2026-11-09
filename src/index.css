@@ -1,0 +1,54 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./theme.css";
+
+/* CanvasOverlays animates with Tailwind's `pulse` keyframes through an inline
+ * style. Tailwind only emits them when the utility is used somewhere, and the
+ * files that used it in Precogly are not part of this app. */
+@source inline("animate-pulse");
+
+@custom-variant touch (@media (hover: none));
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Lock animation for when nodes snap into boundaries */
+@keyframes lock-pulse {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(251, 146, 60, 0.7);
+  }
+  50% {
+    transform: scale(1.02);
+    box-shadow: 0 0 0 8px rgba(251, 146, 60, 0);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(251, 146, 60, 0);
+  }
+}
+
+.animate-lock-pulse {
+  animation: lock-pulse 0.4s ease-out;
+}
+
+/* Connection handles are interaction affordances, not part of the diagram
+ * artwork. Keep the canvas clean until the user hovers a node or enables Flow
+ * mode. The handles remain in the DOM so React Flow can attach connections. */
+.react-flow .react-flow__handle {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+
+.react-flow__node:hover .react-flow__handle,
+.connection-mode .react-flow .react-flow__handle {
+  opacity: 1;
+  pointer-events: auto;
+}

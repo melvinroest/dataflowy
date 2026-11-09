@@ -1,0 +1,134 @@
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { useReactFlow } from '@xyflow/react'
+import { cn } from '@/lib/utils'
+import type { DiagramNode } from '../../types'
+
+interface InlineEditableLabelProps {
+  nodeId: string
+  label: string
+  isEditing?: boolean
+  className?: string
+  inputClassName?: string
+}
+
+export const InlineEditableLabel = memo(function InlineEditableLabel({
+  nodeId,
+  label,
+  isEditing,
+  className,
+  inputClassName,
+}: InlineEditableLabelProps) {
+  const { setNodes, getNode } = useReactFlow<DiagramNode>()
+  const [editValue, setEditValue] = useState(label)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const hasCommittedRef = useRef(false)
+  const originalLabelRef = useRef(label)
+
+  // Reset local state and focus input when entering edit mode.
+  // Intentionally depends only on isEditing — we capture label at the moment editing
+  // starts and must NOT re-run on label changes during typing (which would re-select all text).
+  useEffect(() => {
+    if (isEditing) {
+      hasCommittedRef.current = false
+      // Type to rename has already put the typed character in `label`. The
+      // name it replaced travels in `labelBeforeInlineEdit`, so that Escape
+      // and an empty commit bring back the real name.
+      const replaced = getNode(nodeId)?.data.labelBeforeInlineEdit
+      originalLabelRef.current = typeof replaced === 'string' ? replaced : label
+      setEditValue(label)
+      requestAnimationFrame(() => {
+        if (inputRef.current) {
+          inputRef.current.style.height = 'auto'
+          inputRef.current.style.height = `${inputRef.current.scrollHeight}px`
+        }
+        inputRef.current?.focus()
+        inputRef.current?.select()
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only run when isEditing transitions, not on every label keystroke
+  }, [isEditing])
+
+  // Update both local state (for fast input) and node data (for panel sync)
+  const handleChange = useCallback(
+    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+      const value = e.target.value
+      setEditValue(value)
+      e.target.style.height = 'auto'
+      e.target.style.height = `${e.target.scrollHeight}px`
+      setNodes((nodes) =>
+        nodes.map((n) =>
+          n.id === nodeId
+            ? { ...n, data: { ...n.data, label: value } }
+            : n
+        )
+      )
+    },
+    [nodeId, setNodes]
+  )
+
+  const finishEdit = useCallback(
+    (revert: boolean) => {
+      if (hasCommittedRef.current) return
+      hasCommittedRef.current = true
+
+      const finalLabel = revert
+        ? originalLabelRef.current
+        : (editValue.trim() || originalLabelRef.current)
+
+      setNodes((nodes) =>
+        nodes.map((n) =>
+          n.id === nodeId
+            ? { ...n, data: { ...n.data, label: finalLabel, isInlineEditing: false, labelBeforeInlineEdit: undefined } }
+            : n
+        )
+      )
+    },
+    [nodeId, editValue, setNodes]
+  )
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      e.stopPropagation()
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault()
+        finishEdit(false)
+      } else if (e.key === 'Escape') {
+        finishEdit(true)
+      }
+    },
+    [finishEdit]
+  )
+
+  const handleBlur = useCallback(() => {
+    finishEdit(false)
+  }, [finishEdit])
+
+  // Prevent React Flow from interpreting mouse events on the input
+  const stopPropagation = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation()
+  }, [])
+
+  if (!isEditing) {
+    return <span title={label} className={cn('whitespace-pre-line', className)}>{label}</span>
+  }
+
+  return (
+    <textarea
+      ref={inputRef}
+      value={editValue}
+      onChange={handleChange}
+      onKeyDown={handleKeyDown}
+      onBlur={handleBlur}
+      onClick={stopPropagation}
+      onMouseDown={stopPropagation}
+      onDoubleClick={stopPropagation}
+      rows={1}
+      className={cn(
+        'nodrag nopan nowheel',
+        'bg-transparent border-b border-current outline-none',
+        'text-inherit font-inherit resize-none overflow-hidden min-h-0',
+        inputClassName
+      )}
+    />
+  )
+})

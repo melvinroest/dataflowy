@@ -1,0 +1,608 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
+import { Download, FolderOpen, Pencil, Save, ChevronDown, Undo2, Redo2, HelpCircle, ImageDown, PanelLeft, MoreHorizontal } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Separator } from '@/components/ui/separator'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import { cn } from '@/lib/utils'
+import type { DFDNotationStyle } from '@/features/dfd-editor/types/notation'
+import { useGuestEditor } from '../context/GuestEditorContext'
+import { buildGuestDocument, deserializeCycloneDxToGuest, type DeserializedFile } from '../lib/cyclonedx-guest'
+import { removeDiagramElements } from '../lib/guest-model'
+import {
+  supportsFileSystemAccess,
+  pickFileToSave,
+  pickFileToOpen,
+  writeToHandle,
+  downloadAsFallback,
+  openFileViaInput,
+} from '../lib/file-system-access'
+
+function titleToFilename(title: string): string {
+  return title.replace(/[^a-zA-Z0-9-_ ]/g, '').replace(/\s+/g, '-').toLowerCase() || 'diagram'
+}
+
+interface GuestEditorHeaderProps {
+  title: string
+  onTitleChange: (title: string) => void
+  hasUnsavedChanges: boolean
+  onMarkSaved: () => void
+  onLoadFromFile: (loaded: DeserializedFile) => void
+  /** Undefined when the file did not record a notation; the select then shows the default. */
+  notationStyle?: DFDNotationStyle
+  onNotationChange?: (notation: DFDNotationStyle) => void
+  onOpenExportDialog?: () => void
+  onUndo?: () => void
+  onRedo?: () => void
+  canUndo?: boolean
+  canRedo?: boolean
+  showComponentPanel?: boolean
+  onToggleComponentPanel?: () => void
+  fileHandle: FileSystemFileHandle | null
+  fileName: string | null
+  onFileHandleChange: (handle: FileSystemFileHandle) => void
+  onFileHandleClear: () => void
+}
+
+export function GuestEditorHeader({
+  title,
+  onTitleChange,
+  hasUnsavedChanges,
+  onMarkSaved,
+  onLoadFromFile,
+  notationStyle,
+  onNotationChange,
+  onOpenExportDialog,
+  onUndo,
+  onRedo,
+  canUndo = false,
+  canRedo = false,
+  showComponentPanel = false,
+  onToggleComponentPanel,
+  fileHandle,
+  fileName,
+  onFileHandleChange,
+  onFileHandleClear,
+}: GuestEditorHeaderProps) {
+  const guestEditor = useGuestEditor()
+  const [isEditingTitle, setIsEditingTitle] = useState(false)
+  const [titleValue, setTitleValue] = useState('')
+  const titleInputRef = useRef<HTMLInputElement>(null)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
+
+  // Save dialog state (fallback for browsers without File System Access API)
+  const [showSaveDialog, setShowSaveDialog] = useState(false)
+  const [saveFilename, setSaveFilename] = useState('')
+  const filenameInputRef = useRef<HTMLInputElement>(null)
+
+  // Keyboard shortcut help (? key)
+  useEffect(() => {
+    const handleShortcutHelp = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return
+      if (event.key === '?') {
+        event.preventDefault()
+        setShortcutsOpen(true)
+      }
+    }
+    window.addEventListener('keydown', handleShortcutHelp)
+    return () => window.removeEventListener('keydown', handleShortcutHelp)
+  }, [])
+
+  const handleTitleClick = useCallback(() => {
+    setTitleValue(title)
+    setIsEditingTitle(true)
+    setTimeout(() => titleInputRef.current?.select(), 0)
+  }, [title])
+
+  const handleTitleSave = useCallback(() => {
+    const trimmedTitle = titleValue.trim()
+    if (trimmedTitle && trimmedTitle !== title) {
+      onTitleChange(trimmedTitle)
+    }
+    setIsEditingTitle(false)
+  }, [titleValue, title, onTitleChange])
+
+  const handleTitleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        handleTitleSave()
+      } else if (e.key === 'Escape') {
+        setIsEditingTitle(false)
+      }
+    },
+    [handleTitleSave]
+  )
+
+  // --- Build the CycloneDX document from the current state ---
+  // The version rises when the content changed since the last save or open
+  // (I4); `markSaved` records the written version and digest once the file
+  // is on disk.
+  const buildContent = useCallback(() => {
+    if (!guestEditor) return null
+    // Threats and countermeasures a file carried are not part of the undo
+    // history, so deleting their target on the canvas leaves them alone and
+    // Undo needs nothing back. What the file gets is decided here, by the
+    // same rule as before (H9), against what is on the canvas now.
+    const onCanvas = new Set([...guestEditor.nodes, ...guestEditor.edges].map((element) => element.id))
+    const targetIds = [...guestEditor.getAllThreats(), ...guestEditor.getAllCountermeasures()]
+      .flatMap((item) => item.targets.map((target) => target.id))
+    const kept = removeDiagramElements(
+      guestEditor.getAllThreats(),
+      guestEditor.getAllCountermeasures(),
+      new Set(targetIds.filter((id) => !onCanvas.has(id)))
+    )
+    const result = buildGuestDocument({
+      title,
+      nodes: guestEditor.nodes,
+      edges: guestEditor.edges,
+      threats: kept.threats,
+      countermeasures: kept.countermeasures,
+      systemContext: guestEditor.getSystemContext(),
+      notationStyle,
+      documentState: guestEditor.documentState,
+    })
+    for (const warning of result.warnings) {
+      toast.warning(warning)
+    }
+    return result
+  }, [title, guestEditor, notationStyle])
+
+  const recordSaved = useCallback(
+    (result: { version: number; digest: string }) => {
+      guestEditor?.markSaved(result.version, result.digest)
+      onMarkSaved()
+    },
+    [guestEditor, onMarkSaved]
+  )
+
+  // --- Save handler ---
+  const handleSave = useCallback(async () => {
+    if (!guestEditor) return
+    const result = buildContent()
+    if (!result) return
+    const content = result.json
+
+    if (supportsFileSystemAccess()) {
+      if (fileHandle) {
+        // Silent save to existing handle
+        try {
+          await writeToHandle(fileHandle, content)
+          recordSaved(result)
+        } catch {
+          // The handle might be stale (file deleted externally): clear and prompt again
+          onFileHandleClear()
+          try {
+            const newHandle = await pickFileToSave(`${titleToFilename(title)}.cdx.json`)
+            await writeToHandle(newHandle, content)
+            onFileHandleChange(newHandle)
+            recordSaved(result)
+          } catch (innerError) {
+            // User cancelled: ignore the AbortError
+            if (innerError instanceof DOMException && innerError.name === 'AbortError') return
+          }
+        }
+      } else {
+        // No handle yet: prompt for a location
+        try {
+          const newHandle = await pickFileToSave(`${titleToFilename(title)}.cdx.json`)
+          await writeToHandle(newHandle, content)
+          onFileHandleChange(newHandle)
+          recordSaved(result)
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') return
+        }
+      }
+    } else {
+      // Fallback: show the filename dialog
+      setSaveFilename(titleToFilename(title))
+      setShowSaveDialog(true)
+      setTimeout(() => filenameInputRef.current?.select(), 0)
+    }
+  }, [guestEditor, buildContent, recordSaved, fileHandle, title, onFileHandleChange, onFileHandleClear])
+
+  // --- Save As handler (always prompts for new location) ---
+  const handleSaveAs = useCallback(async () => {
+    if (!guestEditor) return
+    const result = buildContent()
+    if (!result) return
+
+    if (supportsFileSystemAccess()) {
+      try {
+        const newHandle = await pickFileToSave(`${titleToFilename(title)}.cdx.json`)
+        await writeToHandle(newHandle, result.json)
+        onFileHandleChange(newHandle)
+        recordSaved(result)
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+      }
+    } else {
+      setSaveFilename(titleToFilename(title))
+      setShowSaveDialog(true)
+      setTimeout(() => filenameInputRef.current?.select(), 0)
+    }
+  }, [guestEditor, buildContent, recordSaved, title, onFileHandleChange])
+
+  // --- Fallback save dialog confirm ---
+  const handleConfirmSave = useCallback(() => {
+    const result = buildContent()
+    if (!result) return
+    const filename = saveFilename.trim() || titleToFilename(title)
+    downloadAsFallback(filename, result.json)
+    recordSaved(result)
+    setShowSaveDialog(false)
+  }, [saveFilename, title, buildContent, recordSaved])
+
+  // --- Open handler ---
+  const handleOpen = useCallback(async () => {
+    // Opening replaces the canvas, so ask first when there is unsaved work.
+    if (hasUnsavedChanges && !window.confirm('Open another file? Unsaved changes in this diagram will be lost.')) return
+    try {
+      let content: string
+      let handle: FileSystemFileHandle | null = null
+
+      if (supportsFileSystemAccess()) {
+        const result = await pickFileToOpen()
+        content = result.content
+        handle = result.handle
+      } else {
+        content = await openFileViaInput()
+      }
+
+      const loaded = deserializeCycloneDxToGuest(content)
+      onLoadFromFile(loaded)
+
+      if (handle) {
+        onFileHandleChange(handle)
+      } else {
+        onFileHandleClear()
+      }
+    } catch (error) {
+      // User cancelled or AbortError: ignore
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      // Show error for invalid files
+      if (error instanceof Error && error.message) {
+        toast.error(error.message, { duration: Infinity })
+      }
+    }
+  }, [hasUnsavedChanges, onLoadFromFile, onFileHandleChange, onFileHandleClear])
+
+  // --- Ctrl+S / Cmd+S keyboard shortcut ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+        e.preventDefault()
+        handleSave()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [handleSave])
+
+  // Determine save button tooltip
+  const saveTooltip = fileHandle && fileName
+    ? `Save to ${fileName}`
+    : 'Save as CycloneDX JSON'
+
+  return (
+    <>
+      <TooltipProvider delayDuration={300}>
+        <div className="flex items-center gap-2 px-4 py-2 border-b bg-background min-h-[48px]">
+          {/* Sidebar toggle */}
+          {onToggleComponentPanel && (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={cn('gap-1', showComponentPanel && 'bg-muted')}
+                    onClick={onToggleComponentPanel}
+                  >
+                    <PanelLeft className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  {showComponentPanel ? 'Hide' : 'Show'} component panel
+                </TooltipContent>
+              </Tooltip>
+              <Separator orientation="vertical" className="h-6" />
+            </>
+          )}
+
+          <div className="mr-2 min-w-0 max-w-[240px] shrink">
+            {isEditingTitle ? (
+              <input
+                ref={titleInputRef}
+                type="text"
+                value={titleValue}
+                onChange={(e) => setTitleValue(e.target.value)}
+                onBlur={handleTitleSave}
+                onKeyDown={handleTitleKeyDown}
+                className="font-semibold bg-transparent border-b-2 border-primary outline-none px-0 py-0 min-w-[200px]"
+                autoFocus
+              />
+            ) : (
+              <button
+                onClick={handleTitleClick}
+                className="flex items-center gap-2 group text-left"
+              >
+                <h1 className="font-semibold truncate">{title}</h1>
+                <Pencil className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 touch:opacity-100 transition-opacity shrink-0" />
+              </button>
+            )}
+            <p className="text-xs text-muted-foreground truncate">
+              {fileName ? fileName : 'Data Flow Diagram'}
+            </p>
+          </div>
+          {hasUnsavedChanges && (
+            <div className="flex items-center gap-1 text-xs text-muted-foreground">
+              <div className="h-2 w-2 rounded-full bg-yellow-500" />
+              <span>Unsaved</span>
+            </div>
+          )}
+          {/* Canvas tools (from toolbar) */}
+          {(onUndo || onRedo) && (
+            <div className="hidden xl:flex items-center gap-0.5">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onUndo} disabled={!canUndo} aria-label="Undo">
+                    <Undo2 className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Undo (Ctrl/Cmd + Z)</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onRedo} disabled={!canRedo} aria-label="Redo">
+                    <Redo2 className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Redo (Ctrl/Cmd + Shift + Z)</TooltipContent>
+              </Tooltip>
+            </div>
+          )}
+
+          {onNotationChange && (
+            <div className="hidden xl:block">
+              <Select
+                value={notationStyle ?? 'yourdon'}
+                onValueChange={(value) => onNotationChange(value as DFDNotationStyle)}
+              >
+                <SelectTrigger className="h-8 w-[140px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="dfd3">DFD3</SelectItem>
+                  <SelectItem value="yourdon">Yourdon</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          <div className="hidden xl:block">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  aria-label="Keyboard shortcuts"
+                  onClick={() => setShortcutsOpen(true)}
+                >
+                  <HelpCircle className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Keyboard shortcuts (?)</TooltipContent>
+            </Tooltip>
+          </div>
+
+          {onOpenExportDialog && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="gap-2"
+                  onClick={onOpenExportDialog}
+                >
+                  <ImageDown className="h-4 w-4" />
+                  <span className="hidden xl:inline">Export Image</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Download diagram as PNG or SVG</TooltipContent>
+            </Tooltip>
+          )}
+
+          {/* Overflow menu for narrow viewports */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon" className="xl:hidden h-8 w-8" aria-label="More options">
+                <MoreHorizontal className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-48">
+              {(onUndo || onRedo) && (
+                <>
+                  <DropdownMenuItem onClick={onUndo} disabled={!canUndo}>
+                    <Undo2 className="h-4 w-4 mr-2" />
+                    Undo
+                    <DropdownMenuShortcut>⌘Z</DropdownMenuShortcut>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={onRedo} disabled={!canRedo}>
+                    <Redo2 className="h-4 w-4 mr-2" />
+                    Redo
+                    <DropdownMenuShortcut>⇧⌘Z</DropdownMenuShortcut>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </>
+              )}
+              {onNotationChange && (
+                <>
+                  <DropdownMenuLabel className="text-xs text-muted-foreground">Notation</DropdownMenuLabel>
+                  <DropdownMenuRadioGroup value={notationStyle ?? 'yourdon'} onValueChange={(value) => onNotationChange(value as DFDNotationStyle)}>
+                    <DropdownMenuRadioItem value="dfd3">DFD3</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="yourdon">Yourdon</DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                  <DropdownMenuSeparator />
+                </>
+              )}
+              <DropdownMenuItem onClick={() => setShortcutsOpen(true)}>
+                <HelpCircle className="h-4 w-4 mr-2" />
+                Keyboard shortcuts
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {/* Right-aligned items */}
+          <div className="flex items-center gap-2 ml-auto shrink-0">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="sm" onClick={handleOpen}>
+                  <FolderOpen className="h-4 w-4 mr-2" />
+                  Open
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Open a CycloneDX JSON file</TooltipContent>
+            </Tooltip>
+
+            {/* Save button with Save As dropdown */}
+            <div className="flex items-center">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleSave}
+                    className="rounded-r-none"
+                  >
+                    <Save className="h-4 w-4 mr-2" />
+                    Save
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{saveTooltip}</TooltipContent>
+              </Tooltip>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="rounded-l-none px-1.5"
+                  >
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onClick={handleSave}>
+                    <Save className="h-4 w-4 mr-2" />
+                    Save
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={handleSaveAs}>
+                    <Download className="h-4 w-4 mr-2" />
+                    Save As...
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </div>
+        </div>
+      </TooltipProvider>
+
+      {/* Keyboard Shortcuts Dialog */}
+      <Dialog open={shortcutsOpen} onOpenChange={setShortcutsOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Keyboard shortcuts</DialogTitle>
+            <DialogDescription>Shortcuts are active when the canvas is focused and a form field is not being edited.</DialogDescription>
+          </DialogHeader>
+          <div className="divide-y rounded-md border">
+            {[
+              ['Ctrl/Cmd + S', 'Save the diagram'],
+              ['Ctrl/Cmd + Z', 'Undo the last change'],
+              ['Ctrl/Cmd + Shift + Z or Ctrl/Cmd + Y', 'Redo the last undone change'],
+              ['Ctrl/Cmd + A', 'Select all nodes and edges'],
+              ['Ctrl/Cmd + C', 'Copy selected nodes'],
+              ['Ctrl/Cmd + V', 'Paste copied nodes or clipboard text into a selected node'],
+              ['Ctrl/Cmd + D', 'Duplicate selected nodes'],
+              ['Delete / Backspace', 'Delete selected nodes or edges'],
+              ['Escape', 'Deselect and cancel the active interaction'],
+            ].map(([shortcut, description]) => (
+              <div key={shortcut} className="flex items-center justify-between gap-4 px-3 py-2 text-sm">
+                <kbd className="rounded border bg-muted px-2 py-1 font-mono text-xs whitespace-nowrap">{shortcut}</kbd>
+                <span className="text-right text-muted-foreground">{description}</span>
+              </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Save filename dialog (fallback for browsers without File System Access API) */}
+      <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
+        <DialogContent className="sm:max-w-[400px]">
+          <DialogHeader>
+            <DialogTitle>Save Diagram</DialogTitle>
+            <DialogDescription>Choose a filename for your diagram.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="save-filename">Filename</Label>
+            <div className="flex items-center gap-1">
+              <Input
+                ref={filenameInputRef}
+                id="save-filename"
+                value={saveFilename}
+                onChange={(e) => setSaveFilename(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleConfirmSave()
+                }}
+                className="flex-1"
+              />
+              <span className="text-sm text-muted-foreground shrink-0">.cdx.json</span>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowSaveDialog(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleConfirmSave}>
+              <Download className="h-4 w-4 mr-2" />
+              Download
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
